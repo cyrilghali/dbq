@@ -1,0 +1,555 @@
+#!/bin/bash
+# dbq — query a Postgres database from the terminal, without a running MCP
+# server or client to keep alive: it resolves the source and connects fresh
+# on every call, so a VPN blip or a stale session never costs a restart.
+#
+#   dbq <source> "select count(*) from <table>"
+#   dbq <source> '\d <table>'
+#   dbq --json <source> "select id, name from <table> limit 5"
+#   dbq <source> --csv -f report.sql
+#   echo "select now()" | dbq <source>
+#   dbq                                    # list sources
+#   dbq --history [pattern]                # search past queries
+#
+# Credentials and DSNs come from a TOML template (see TEMPLATE below) plus a
+# macOS keychain service (KC_SERVICE), so a secret still rotates in one
+# place. Only the credentials the chosen source needs are read, so a local
+# query never puts remote secrets in a subprocess environment. The connection
+# is exported as PG* variables rather than passed as arguments, so the
+# password stays out of psql's argv; it is in the process environment while
+# the query runs, which is visible to this user's own processes — as are the
+# keychain items themselves, which are stored with -A and read without a
+# prompt, so that costs nothing extra.
+#
+# A source can be routable only from a given Tailscale tailnet (TAILNET); off
+# that profile its hostname resolves and then hangs. Rather than failing,
+# this switches the profile and waits for the tunnel. States it cannot fix on
+# its own (logged out, stopped) name the command that fixes them.
+#
+# See README.md for the config file format and how to set this up.
+#
+# Environment-specific values (TEMPLATE, PSQL, TAILNET, KC_SERVICE) live in a
+# config file at ${DBQ_CONFIG:-~/.config/dbq/config}, so this script itself
+# carries no environment specifics.
+
+set -euo pipefail
+
+die() { printf 'dbq: %s\n' "$*" >&2; exit 1; }
+now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
+
+# ── history ────────────────────────────────────────────────────────────────
+HIST_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/dbq"
+HIST_FILE="$HIST_DIR/history.jsonl"
+
+record_history() {
+  local status="$1" rows="$2" truncated="$3" wait_ms="${4:-0}" end_ms
+  end_ms="$(now_ms)"
+  {
+    mkdir -p -m 700 "$HIST_DIR"
+    [ -f "$HIST_FILE" ] || { : >"$HIST_FILE"; chmod 600 "$HIST_FILE"; }
+    python3 -c '
+import json, sys, datetime
+source, sql, rows, duration_ms, status, truncated, wait_ms = sys.argv[1:8]
+entry = {
+    "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "source": source,
+    "sql": sql,
+    "rows": int(rows) if rows.strip() else None,
+    "duration_ms": int(duration_ms),
+    "exit": int(status),
+    "truncated": truncated == "true",
+    "wait_ms": int(wait_ms),
+}
+print(json.dumps(entry))
+' "$SOURCE" "$HIST_SQL" "$rows" "$((end_ms - START_MS))" "$status" "$truncated" "$wait_ms" >>"$HIST_FILE"
+  } 2>/dev/null || true
+}
+
+if [ "${1:-}" = --history ]; then
+  shift
+  pattern=""; hsource=""; hlimit=20; hjson=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --source) [ $# -ge 2 ] || die "--source needs a value"; hsource="$2"; shift 2 ;;
+      --limit)  [ $# -ge 2 ] || die "--limit needs a value"; hlimit="$2"; shift 2 ;;
+      --json)   hjson=1; shift ;;
+      -*)       die "unknown --history flag: $1" ;;
+      *)        pattern="$1"; shift ;;
+    esac
+  done
+  [ -f "$HIST_FILE" ] || exit 0
+  python3 - "$HIST_FILE" "$pattern" "$hsource" "$hlimit" "$hjson" <<'PY'
+import json, sys
+file, pattern, source, limit, as_json = sys.argv[1:6]
+limit = int(limit)
+pattern = pattern.lower()
+matches = []
+with open(file) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        if pattern and pattern not in e.get("sql", "").lower():
+            continue
+        if source and e.get("source") != source:
+            continue
+        matches.append((line, e))
+matches = matches[-limit:][::-1]
+for line, e in matches:
+    if as_json == "1":
+        print(line)
+        continue
+    sql = e.get("sql", "").replace("\n", " ")[:120]
+    rows = e.get("rows")
+    print("%s  %-14s rows=%-6s %6sms exit=%-3s %s" % (
+        e.get("ts", ""), e.get("source", ""),
+        rows if rows is not None else "-",
+        e.get("duration_ms", "-"), e.get("exit", "-"), sql))
+PY
+  exit 0
+fi
+
+# ── config ─────────────────────────────────────────────────────────────────
+DBQ_CONFIG="${DBQ_CONFIG:-$HOME/.claude/dbq.conf}"
+[ -f "$DBQ_CONFIG" ] ||
+  die "config file not found: $DBQ_CONFIG (needs TEMPLATE, PSQL, TAILNET, KC_SERVICE)"
+# shellcheck disable=SC1090
+. "$DBQ_CONFIG"
+for var in TEMPLATE PSQL TAILNET KC_SERVICE; do
+  [ -n "${!var:-}" ] || die "$DBQ_CONFIG is missing $var"
+done
+
+TIMEOUT=60          # statement_timeout, seconds (0 = none)
+MAX_BYTES=262144    # output cap when stdout is not a terminal (0 = none)
+JSON=0
+
+# Per-source concurrency cap, config-overridable; unset in the config falls
+# back to these.
+: "${QUEUE_WAIT_FACTOR:=2}"     # slot wait = this × the statement timeout
+LOCKF=/usr/bin/lockf
+[ -x "$LOCKF" ] || die "lockf not found at $LOCKF"
+
+sources() { grep -o '^id = "[^"]*"' "$TEMPLATE" | cut -d'"' -f2; }
+
+usage() {
+  # Requested help belongs on stdout so it can be piped; a usage error does not.
+  local code="${1:-1}" out=2
+  if [ "$code" = 0 ]; then out=1; fi
+  cat >&"$out" <<EOF
+usage: dbq [flags] <source> [sql | psql args...]
+
+  <source>          $(sources | tr '\n' ' ')
+                    a unique prefix works: prod-m, stag-s
+  [sql]             a bare argument is run as SQL, wherever it sits among the
+                    psql flags; otherwise arguments go to psql untouched
+                    (-f file, --csv, -A -F'\t', …), and SQL with no argument is
+                    read from stdin. Use -- for SQL that starts with a dash.
+
+flags (before the source or just after it; --json and --all go anywhere):
+  --json            aggregate a single SELECT into a JSON array
+  --timeout N       statement timeout in seconds (default $TIMEOUT, 0 = none)
+  --max-bytes N     cap output when piped (default $MAX_BYTES, 0 = none)
+  --all             no output cap
+  --sources         print the source list and exit
+  --history [pat]   search past queries (see below)
+  -h, --help        this
+
+examples:
+  dbq <source> "select count(*) from <table>"
+  dbq <source> '\d <table>'                         # columns, indexes, defaults
+  dbq <source> '\dt'                                # every table
+  dbq --json <source> "select <col>, count(*) from <table> group by 1"
+  dbq <source> "select 1; select 2"                 # several statements, one call
+  dbq <source> --csv -f report.sql
+  echo "select now()" | dbq <source>
+  dbq --timeout 300 <source> "select count(*) from <table>"
+
+dbq --history [pattern]
+  Prints past queries, newest first: time, source, rows, duration, exit, and
+  the first 120 characters of the SQL. pattern is a case-insensitive substring
+  match over the SQL.
+    --source <name>   only this source
+    --limit N         how many entries (default 20)
+    --json            print the raw history.jsonl lines instead
+
+Any source not named local-* runs read-only with a statement timeout and a
+cap on concurrent connections (MAX_CONCURRENT in the config); local does not.
+Output is capped only when stdout is not a terminal, so interactive paging is
+unaffected — a truncated run says so on stderr and still exits 0.
+Exit codes are psql's: 0 ok, 1 SQL error, 2 connection failure.
+EOF
+  exit "$code"
+}
+
+# dbq's own flags, accepted before the source and again just after it, so
+# both `dbq --json <source> …` and `dbq <source> --json …` work.
+# Anything else is left for psql.
+FLAGS_LEFT=()
+take_flags() {
+  FLAGS_LEFT=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json)      JSON=1; shift ;;
+      --all)       MAX_BYTES=0; shift ;;
+      --max-bytes) [ $# -ge 2 ] || die "--max-bytes needs a value"; MAX_BYTES="$2"; shift 2 ;;
+      --timeout)   [ $# -ge 2 ] || die "--timeout needs a value"; TIMEOUT="$2"; shift 2 ;;
+      --sources)   sources; exit 0 ;;
+      -h|--help)   usage 0 ;;
+      *)           break ;;
+    esac
+  done
+  FLAGS_LEFT=("$@")
+}
+
+[ $# -gt 0 ] || usage
+take_flags "$@"
+set -- ${FLAGS_LEFT+"${FLAGS_LEFT[@]}"}
+[ $# -gt 0 ] || usage
+
+# Checked one at a time: an empty value concatenated with a valid one would pass
+# a combined test, and anything past ten digits overflows bash's integer test and
+# would silently drop the setting.
+for n in "$TIMEOUT" "$MAX_BYTES"; do
+  case "$n" in ''|*[!0-9]*) die "--timeout and --max-bytes take a whole number" ;; esac
+  [ "${#n}" -le 10 ] || die "--timeout / --max-bytes value is out of range"
+done
+
+# Resolve the source by exact name, else by unique prefix. Matched literally:
+# through grep, a typo like `local.main` would quietly resolve to local-main.
+WANT="$1"; shift
+SOURCE=""
+matches=()
+while IFS= read -r s; do
+  [ "$s" = "$WANT" ] && SOURCE="$s"
+  case "$s" in "$WANT"*) matches+=("$s") ;; esac
+done < <(sources)
+if [ -z "$SOURCE" ]; then
+  case ${#matches[@]} in
+    1) SOURCE="${matches[0]}" ;;
+    0) die "unknown source '$WANT' — have: $(sources | tr '\n' ' ')" ;;
+    *) die "source '$WANT' is ambiguous: ${matches[*]}" ;;
+  esac
+fi
+
+# Default cap depends on the source; an explicit MAX_CONCURRENT in the config
+# overrides it for every source, local included (needed to test the cap
+# without touching prod).
+if [ -z "${MAX_CONCURRENT:-}" ]; then
+  case "$SOURCE" in local-*) MAX_CONCURRENT=0 ;; *) MAX_CONCURRENT=2 ;; esac
+fi
+
+take_flags "$@"
+set -- ${FLAGS_LEFT+"${FLAGS_LEFT[@]}"}
+
+[ -x "$PSQL" ] || die "psql not found at $PSQL — brew install libpq"
+
+# ── tailnet ────────────────────────────────────────────────────────────────
+ts_state() {
+  tailscale status --json 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print(d.get("BackendState", ""), (d.get("CurrentTailnet") or {}).get("Name", "-"))
+' 2>/dev/null || true
+}
+
+if [[ "$SOURCE" != local-* ]]; then
+  read -r state tailnet <<<"$(ts_state)"
+  [ -n "${state:-}" ] ||
+    die "Tailscale isn't running — $SOURCE is only reachable on the $TAILNET tailnet"
+
+  if [ "$state" != Running ] || [ "$tailnet" != "$TAILNET" ]; then
+    # A disconnected profile reports no tailnet at all, so the selected account
+    # comes from the profile list, where an asterisk marks the current one.
+    # Correct the profile before judging the connection: sitting on the perso
+    # profile is the ordinary case here, and it is the one thing we can fix.
+    selected="$(tailscale switch --list 2>/dev/null | awk '$3 ~ /\*$/ {print $2; exit}')"
+    if [ "$selected" != "$TAILNET" ]; then
+      printf 'dbq: switching tailnet %s -> %s\n' "${selected:-$tailnet}" "$TAILNET" >&2
+      tailscale switch "$TAILNET" >/dev/null 2>&1 ||
+        die "could not switch to the $TAILNET tailnet — run: tailscale switch --list"
+    fi
+    # switch returns before the tunnel is up; wait for a usable interface.
+    if ! tailscale wait --timeout=20s 2>/dev/null; then
+      read -r state tailnet <<<"$(ts_state)"
+      case "$state" in
+        NeedsLogin|NeedsMachineAuth) die "Tailscale is logged out of $TAILNET — run: tailscale login" ;;
+        Stopped)                     die "Tailscale is stopped — run: tailscale up" ;;
+        *) die "Tailscale is on '${tailnet}' in state '${state:-unknown}' — run: tailscale status" ;;
+      esac
+    fi
+  fi
+fi
+
+# ── connection ─────────────────────────────────────────────────────────────
+# The credentials a source needs are read straight off its own dsn line in
+# TEMPLATE: any ${PREFIX_ITEM} placeholder names a keychain item, where
+# PREFIX is KC_SERVICE upper-cased. A source with no placeholders (local,
+# typically) needs nothing.
+PREFIX="$(printf '%s_' "$KC_SERVICE" | tr 'a-z-' 'A-Z_')"
+raw_dsn="$(python3 -c '
+import re, sys
+raw = open(sys.argv[1]).read()
+m = re.search(r"^id = \"%s\"\ndsn = \"([^\"]+)\"" % re.escape(sys.argv[2]), raw, re.M)
+print(m.group(1) if m else "")
+' "$TEMPLATE" "$SOURCE")"
+need=()
+if [ -n "$raw_dsn" ]; then
+  while IFS= read -r ph; do
+    case "$ph" in "$PREFIX"*) need+=("$(printf '%s' "${ph#"$PREFIX"}" | tr 'A-Z_' 'a-z-')") ;; esac
+  done < <(printf '%s' "$raw_dsn" | grep -oE '\$\{[A-Za-z0-9_]+\}' | sed -E 's/[${}]//g' | sort -u)
+fi
+
+vars=()
+for item in ${need+"${need[@]}"}; do
+  var="${PREFIX}$(printf '%s' "$item" | tr 'a-z-' 'A-Z_')"
+  value="$(/usr/bin/security find-generic-password -s "$KC_SERVICE" -a "$item" -w 2>/dev/null || true)"
+  [ -n "$value" ] ||
+    die "keychain item '$item' missing — add it with: security add-generic-password -s $KC_SERVICE -a $item -w <value>"
+  export "$var=$value"
+  vars+=("$var")
+done
+unset value
+
+conn="$(python3 - "$TEMPLATE" "$SOURCE" <<'PY'
+import os, re, string, sys
+from urllib.parse import urlsplit, unquote
+
+# Render only the one DSN, so the placeholders of the other sources need not be
+# in the environment at all. .substitute (not safe_substitute) still fails loudly
+# on a placeholder this source really does need.
+raw = open(sys.argv[1]).read()
+m = re.search(r'^id = "%s"\ndsn = "([^"]+)"' % re.escape(sys.argv[2]), raw, re.M)
+if not m:
+    sys.exit("no dsn for source " + sys.argv[2])
+u = urlsplit(string.Template(m.group(1)).substitute(os.environ))
+q = dict(p.split("=", 1) for p in u.query.split("&") if "=" in p)
+for k, v in (
+    ("PGHOST", u.hostname),
+    ("PGPORT", str(u.port or 5432)),
+    ("PGUSER", unquote(u.username or "")),
+    ("PGPASSWORD", unquote(u.password or "")),
+    ("PGDATABASE", u.path.lstrip("/")),
+    ("PGSSLMODE", q.get("sslmode", "prefer")),
+):
+    if "\n" in v:
+        sys.exit("refusing to export %s: value contains a newline" % k)
+    print("%s=%s" % (k, v))
+PY
+)" || die "could not resolve the connection for $SOURCE"
+while IFS='=' read -r k v; do export "$k=$v"; done <<<"$conn"
+unset conn
+[ ${#vars[@]} -eq 0 ] || unset "${vars[@]}"
+
+opts=("-c" "application_name=dbq")
+[ "$TIMEOUT" -gt 0 ] && opts+=("-c" "statement_timeout=$((TIMEOUT * 1000))")
+if [[ "$SOURCE" != local-* ]]; then
+  export PGCONNECT_TIMEOUT=10
+  opts+=("-c" "default_transaction_read_only=on")
+else
+  export PGCONNECT_TIMEOUT=5
+fi
+[ ${#opts[@]} -eq 0 ] || export PGOPTIONS="${opts[*]}"
+
+# ── query ──────────────────────────────────────────────────────────────────
+# The SQL is the one argument that is neither a flag nor a flag's value, wherever
+# it sits — otherwise `dbq local-main --csv "select …"` hands psql the query as
+# a database name and fails with a baffling "database does not exist".
+SQL=""; PSQL_ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --) shift
+        if [ -z "$SQL" ] && [ $# -gt 0 ]; then SQL="$1"; shift; fi
+        PSQL_ARGS+=(${1+"$@"}); break ;;
+    -c|-f|-d|-h|-p|-U|-v|-F|-R|-P|-o|-L|-T|--command|--file|--dbname|--host|--port|--username|--set|--variable|--field-separator|--record-separator|--pset|--output|--log-file|--table-attr)
+        [ $# -ge 2 ] || die "$1 needs a value"
+        PSQL_ARGS+=("$1" "$2"); shift 2 ;;
+    --json) JSON=1; shift ;;
+    --all)  MAX_BYTES=0; shift ;;
+    --timeout|--max-bytes) die "$1 goes before the SQL: dbq $1 N <source> …" ;;
+    -*) PSQL_ARGS+=("$1"); shift ;;
+    *)  if [ -z "$SQL" ]; then SQL="$1"; else PSQL_ARGS+=("$1"); fi; shift ;;
+  esac
+done
+set -- ${PSQL_ARGS+"${PSQL_ARGS[@]}"}
+
+if [ "$JSON" = 1 ]; then
+  [ -n "$SQL" ] || SQL="$(cat)"
+  [ -n "$SQL" ] || die "--json needs a query, as an argument or on stdin"
+  # A trailing semicolon is a syntax error once the query becomes a subquery.
+  SQL="$(printf '%s' "$SQL" | sed -E 's/[[:space:];]+$//')"
+  opening="$(printf '%s\n' "$SQL" | grep -vE '^[[:space:]]*(--.*)?$' | head -1 |
+             sed -E 's/^[[:space:]]+//' | tr '[:upper:]' '[:lower:]')"
+  case "$opening" in
+    select*|with*|table*|values*) ;;
+    *) die "--json takes a single SELECT (got: ${opening%%[[:space:]]*})" ;;
+  esac
+  set -- -t -A -c "select coalesce(json_agg(_q)::text, '[]') from ( $SQL ) _q" "$@"
+elif [ -n "$SQL" ]; then
+  set -- -c "$SQL" "$@"
+elif [ ! -t 0 ]; then
+  # No bare SQL and no -f: read stdin ourselves so it lands in history too,
+  # unless a real terminal is attached, in which case leave psql's own
+  # interactive stdin handling alone.
+  has_file=0
+  for a in ${PSQL_ARGS+"${PSQL_ARGS[@]}"}; do
+    case "$a" in -f|--file) has_file=1 ;; esac
+  done
+  if [ "$has_file" = 0 ]; then
+    SQL="$(cat)"
+    set -- -c "$SQL" "$@"
+  fi
+fi
+
+# Full query text for the history line: the bare/stdin SQL above, or an -f
+# file's contents when neither was set.
+HIST_SQL="$SQL"
+if [ -z "$HIST_SQL" ]; then
+  prev=""
+  for a in ${PSQL_ARGS+"${PSQL_ARGS[@]}"}; do
+    case "$prev" in -f|--file) HIST_SQL="$(cat "$a" 2>/dev/null || true)"; break ;;
+    esac
+    prev="$a"
+  done
+fi
+START_MS="$(now_ms)"
+
+# A slot always frees within its holder's statement timeout, so the wait for
+# one follows it; --timeout 0 (no timeout) falls back to a flat 10 minutes
+# rather than waiting forever.
+if [ "$TIMEOUT" -gt 0 ]; then QUEUE_WAIT=$((QUEUE_WAIT_FACTOR * TIMEOUT)); else QUEUE_WAIT=600; fi
+WAITFILE="$(mktemp "${TMPDIR:-/tmp}/dbq.XXXXXX")"
+trap 'rm -f "$WAITFILE"' EXIT INT TERM HUP
+
+# Caps concurrent connections per source: local is unrestricted, everything
+# else takes one of MAX_CONCURRENT lock-file slots first. A slot is a plain
+# lockf(1) lock held on the fd it hands to the exec'd psql, so it releases
+# itself on exit or crash with no daemon or cleanup step. -t 0 only tests
+# whether a slot is free right now; run_query itself supplies the retry loop
+# so the wait time is ours to measure for wait_ms.
+run_query() {
+  printf '0' >"$WAITFILE"
+  if [ "$MAX_CONCURRENT" -le 0 ]; then
+    "$PSQL" -v ON_ERROR_STOP=1 "$@"
+    return $?
+  fi
+  local lockdir="$HIST_DIR/locks" wait_start slot marker status
+  mkdir -p "$lockdir" 2>/dev/null || true
+  wait_start="$(now_ms)"
+  while :; do
+    slot=1
+    while [ "$slot" -le "$MAX_CONCURRENT" ]; do
+      marker="$(mktemp -u "${TMPDIR:-/tmp}/dbq-lock.XXXXXX")"
+      # The marker is written the instant the lock is granted, before psql
+      # runs, so its timestamp is the acquire time, not whenever this blocking
+      # call happens to return (which is after the query itself finishes).
+      "$LOCKF" -t 0 "$lockdir/$SOURCE.$slot" \
+        bash -c 'python3 -c "import time,sys; open(sys.argv[1], \"w\").write(str(int(time.time()*1000)))" "$1"; shift; exec "$@"' \
+        _ "$marker" "$PSQL" -v ON_ERROR_STOP=1 "$@"
+      status=$?
+      if [ -f "$marker" ]; then
+        printf '%s' "$(( $(cat "$marker") - wait_start ))" >"$WAITFILE"
+        rm -f "$marker"
+        return "$status"
+      fi
+      slot=$((slot + 1))
+    done
+    if [ $(( $(now_ms) - wait_start )) -ge $((QUEUE_WAIT * 1000)) ]; then
+      printf '%s' "$(( $(now_ms) - wait_start ))" >"$WAITFILE"
+      printf 'dbq: all %s slots for %s are busy — waited %ss\n' "$MAX_CONCURRENT" "$SOURCE" "$QUEUE_WAIT" >&2
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+# psql exits 0/1 (SQL error)/2 (connection)/3 (-f with ON_ERROR_STOP); those
+# codes are the CLI's, so run it in the foreground and pass them through.
+# Rows are left null here: capturing output to count them would turn psql's
+# stdout into a pipe and break its interactive formatting/paging.
+if [ -t 1 ] || [ "$MAX_BYTES" -eq 0 ]; then
+  set +e
+  run_query "$@"
+  status=$?
+  set -e
+  record_history "$status" "" false "$(cat "$WAITFILE")"
+  exit "$status"
+fi
+
+# Piped: cap the output so one careless `select *` cannot flood a caller.
+# Truncation is decided by how many bytes actually arrived, never by psql's exit
+# code: when the whole result fits in the pipe buffer psql finishes and exits 0
+# before head closes the pipe, so waiting for SIGPIPE would truncate in silence.
+# head still stops the transfer early, so the spill holds a page at most.
+spill="$(mktemp "${TMPDIR:-/tmp}/dbq.XXXXXX")"
+errors="$(mktemp "${TMPDIR:-/tmp}/dbq.XXXXXX")"
+trap 'rm -f "$spill" "$errors" "$WAITFILE"' EXIT INT TERM HUP
+set +e
+run_query "$@" 2>"$errors" | head -c $((MAX_BYTES + 1)) >"$spill"
+status=${PIPESTATUS[0]}
+cat "$errors" >&2
+# A caller that guessed a name gets the real ones back, so its retry is right
+# the first time. information_schema lists only columns this role may read, so
+# a column-granted table shows what a query can actually select.
+catalog() { "$PSQL" -X -q -t -A -F': ' -c "$1" 2>/dev/null; }
+# Anchored on ERROR so a NOTICE from IF EXISTS, or the "column … of relation …"
+# wording of a write, is not read as a missing table.
+missing_relation="$(sed -nE 's/.*ERROR: +relation "([^"]+)" does not exist.*/\1/p' "$errors" | head -1)"
+if [ "$status" -eq 0 ]; then
+  :
+elif [ -n "$missing_relation" ]; then
+  close="$(catalog "select table_name from information_schema.tables
+                    where table_schema not in ('pg_catalog', 'information_schema')" |
+           python3 -c 'import sys, difflib
+names = sys.stdin.read().split()
+print(", ".join(difflib.get_close_matches(sys.argv[1].split(".")[-1], names, 5, 0.6)))' "$missing_relation")"
+  printf 'dbq: no table "%s" in %s; closest: %s (other sources: %s)\n' \
+    "$missing_relation" "$SOURCE" "${close:-none}" "$(sources | grep -vx "$SOURCE" | tr '\n' ' ')" >&2
+elif grep -qE 'column .* does not exist' "$errors" && [ -n "$SQL" ]; then
+  # Only identifier characters survive the grep, so inlining the names is safe.
+  tables="$(printf '%s' "$SQL" | grep -oiE '(from|join|update|into)[[:space:]]+[a-z_][a-z0-9_.]*' |
+            awk '{print $2}' | sed 's/.*\.//' | tr '[:upper:]' '[:lower:]' | sort -u |
+            sed "s/.*/'&'/" | paste -sd, -)"
+  if [ -n "$tables" ]; then
+    catalog "select table_name, string_agg(column_name, ', ' order by ordinal_position)
+             from information_schema.columns
+             where table_schema not in ('pg_catalog', 'information_schema') and table_name in ($tables)
+             group by 1" | sed 's/^/dbq: columns of /' >&2
+  fi
+fi
+set -e
+bytes="$(wc -c <"$spill" | tr -d ' ')"
+truncated=false
+[ "$bytes" -le "$MAX_BYTES" ] || truncated=true
+if [ "$truncated" = true ] && [ "$status" -eq 141 ]; then status=0; fi
+
+# rows: the JSON array's length, or psql's last "(N rows)" footer; null (empty)
+# when the output was cut before either could be read.
+if [ "$truncated" = true ]; then
+  rows=""
+elif [ "$JSON" = 1 ]; then
+  rows="$(python3 -c '
+import json, sys
+try:
+    print(len(json.load(open(sys.argv[1]))))
+except Exception:
+    pass
+' "$spill" 2>/dev/null || true)"
+else
+  rows="$(grep -oE '\([0-9]+ rows?\)' "$spill" | tail -1 | grep -oE '[0-9]+' || true)"
+fi
+record_history "$status" "$rows" "$truncated" "$(cat "$WAITFILE" 2>/dev/null || echo 0)"
+
+if [ "$truncated" = true ] && [ "$JSON" = 1 ]; then
+  # Cut JSON never parses, so a partial array is worse than none.
+  die "--json result is over $MAX_BYTES bytes — add a LIMIT, raise --max-bytes, or pass --all"
+elif [ "$truncated" = true ]; then
+  head -c "$MAX_BYTES" "$spill"
+  printf '\ndbq: output truncated at %s bytes — add a LIMIT, or pass --all\n' "$MAX_BYTES" >&2
+else
+  cat "$spill"
+fi
+exit "$status"

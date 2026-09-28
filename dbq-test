@@ -1,0 +1,271 @@
+#!/bin/bash
+# Self-check for dbq. Needs a local Postgres up on localhost:5432 with a
+# database named "main" reachable as user "postgres" / password
+# "postgrespassword" (createuser/createdb, or just point PGPASSWORD at
+# whatever your local instance already accepts — see README.md).
+#
+# Builds its own throwaway source template and config so it never touches
+# ~/.config/dbq/config; only local-* sources are ever actually queried.
+#
+#   ./dbq-test
+set -uo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DBQ="${DBQ:-$DIR/dbq}"
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/dbq-test.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+
+# A throwaway source list: two local sources (only these are ever queried)
+# plus four unreachable placeholders, just to exercise prefix/ambiguity
+# resolution and the source listing without needing real infrastructure.
+cat >"$WORK/sources.toml" <<'EOF'
+[[sources]]
+id = "local-main"
+dsn = "postgresql://postgres:postgrespassword@localhost:5432/main"
+
+[[sources]]
+id = "local-secondary"
+dsn = "postgresql://postgres:postgrespassword@localhost:5432/secondary"
+
+[[sources]]
+id = "staging-primary"
+dsn = "postgresql://user:pass@staging.example.com:5432/primary"
+
+[[sources]]
+id = "staging-reports"
+dsn = "postgresql://user:pass@staging.example.com:5432/reports"
+
+[[sources]]
+id = "prod-primary"
+dsn = "postgresql://user:pass@prod.example.com:5432/primary"
+
+[[sources]]
+id = "prod-reports"
+dsn = "postgresql://user:pass@prod.example.com:5432/reports"
+EOF
+
+cat >"$WORK/config" <<EOF
+TEMPLATE="$WORK/sources.toml"
+PSQL="$(command -v psql || echo /opt/homebrew/opt/libpq/bin/psql)"
+TAILNET="example.ts.net"
+KC_SERVICE="dbq-test"
+EOF
+export DBQ_CONFIG="$WORK/config"
+
+# History goes to a scratch dir so this run never touches the real log and
+# starts from a clean slate for the pattern/filter assertions below.
+export XDG_STATE_HOME="$WORK/state"
+HIST_FILE="$WORK/state/dbq/history.jsonl"
+
+pass=0; fail=0
+
+ok()  { pass=$((pass + 1)); printf '  \033[32mok\033[0m   %s\n' "$1"; }
+no()  { fail=$((fail + 1)); printf '  \033[31mFAIL\033[0m %s\n       %.300s\n' "$1" "$(printf '%s' "$2" | tr '\n' '⏎')"; }
+
+# want <name> <expected-exit> <cmd...>  — asserts exit code, keeps output in $out
+want() {
+  local name="$1" code="$2"; shift 2
+  out="$("$@" 2>&1)"; local got=$?
+  [ "$got" = "$code" ] || { no "$name" "exit $got, expected $code — $out"; return 1; }
+  return 0
+}
+has() { case "$2" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
+
+printf '\ndbq self-check (%s)\n\n' "$DBQ"
+
+# ── argument handling ──────────────────────────────────────────────────────
+want 'sources listed' 0 "$DBQ" --sources &&
+  { [ "$(printf '%s\n' "$out" | grep -c .)" = 6 ] &&
+    has prod-reports "$out" && ok 'sources listed' || no 'sources listed' "$out"; }
+
+want 'help exits 0' 0 "$DBQ" --help && ok 'help exits 0'
+
+want 'bare invocation is usage' 1 "$DBQ" &&
+  { has 'usage: dbq' "$out" && ok 'bare invocation is usage' || no 'bare invocation is usage' "$out"; }
+
+want 'unknown source rejected' 1 "$DBQ" nope 'select 1' &&
+  { has "unknown source 'nope'" "$out" && ok 'unknown source rejected' || no 'unknown source rejected' "$out"; }
+
+want 'ambiguous prefix rejected' 1 "$DBQ" prod 'select 1' &&
+  { has ambiguous "$out" && has prod-primary "$out" && has prod-reports "$out" &&
+    ok 'ambiguous prefix rejected' || no 'ambiguous prefix rejected' "$out"; }
+
+want 'bad --max-bytes rejected' 1 "$DBQ" --max-bytes abc local-main 'select 1' &&
+  ok 'bad --max-bytes rejected'
+
+want 'empty --timeout rejected' 1 "$DBQ" --timeout '' local-main 'select 1' &&
+  ok 'empty --timeout rejected'
+
+want 'empty --max-bytes rejected' 1 "$DBQ" --max-bytes '' local-main 'select 1' &&
+  ok 'empty --max-bytes rejected'
+
+# Past ten digits bash's integer test overflows and silently drops the setting.
+want 'overflowing --timeout rejected' 1 "$DBQ" --timeout 9999999999999999999 local-main 'select 1' &&
+  ok 'overflowing --timeout rejected'
+
+want 'missing flag value rejected' 1 "$DBQ" --timeout &&
+  ok 'missing flag value rejected'
+
+# The source is matched literally: through a regex, a dot would match the dash.
+want 'source matched literally' 1 "$DBQ" local.main 'select 1' &&
+  { has 'unknown source' "$out" && ok 'source matched literally' || no 'source matched literally' "$out"; }
+
+# ── local queries ──────────────────────────────────────────────────────────
+want 'unique prefix resolves' 0 "$DBQ" local-m 'select 1 as n' &&
+  { has 'n' "$out" && ok 'unique prefix resolves' || no 'unique prefix resolves' "$out"; }
+
+want 'sql from stdin' 0 bash -c "echo 'select 42 as answer' | '$DBQ' local-main" &&
+  { has 42 "$out" && ok 'sql from stdin' || no 'sql from stdin' "$out"; }
+
+want 'multi-statement in one call' 0 "$DBQ" local-main 'select 1 as a; select 2 as b' &&
+  { has ' a ' "$out" && has ' b ' "$out" && ok 'multi-statement in one call' || no 'multi-statement in one call' "$out"; }
+
+want 'backslash command' 0 "$DBQ" local-main '\dt' &&
+  { has 'List of' "$out" && ok 'backslash command' || no 'backslash command' "$out"; }
+
+want 'psql flags pass through' 0 "$DBQ" local-main --csv 'select 1 as a, 2 as b' &&
+  { has 'a,b' "$out" && ok 'psql flags pass through' || no 'psql flags pass through' "$out"; }
+
+want 'sql error exits 1' 1 "$DBQ" local-main 'select 1/0' &&
+  { has 'division by zero' "$out" && ok 'sql error exits 1' || no 'sql error exits 1' "$out"; }
+
+want 'local allows writes' 0 "$DBQ" local-main 'create temp table dbq_test_probe(x int); insert into dbq_test_probe values (1)' &&
+  ok 'local allows writes'
+
+# ── json ───────────────────────────────────────────────────────────────────
+want 'json array' 0 "$DBQ" --json local-main 'select 1 as a, 2 as b' &&
+  { [ "$(printf '%s' "$out" | tr -d ' \n')" = '[{"a":1,"b":2}]' ] &&
+    ok 'json array' || no 'json array' "$out"; }
+
+want 'json empty set is []' 0 "$DBQ" --json local-main 'select 1 where false' &&
+  { [ "$(printf '%s' "$out" | tr -d ' \n')" = '[]' ] && ok 'json empty set is []' || no 'json empty set is []' "$out"; }
+
+want 'json strips trailing semicolon' 0 "$DBQ" --json local-main 'select 1 as a;  ' &&
+  { has '"a":1' "$out" && ok 'json strips trailing semicolon' || no 'json strips trailing semicolon' "$out"; }
+
+want 'json flag after source' 0 "$DBQ" local-main --json 'select 1 as a' &&
+  { has '"a":1' "$out" && ok 'json flag after source' || no 'json flag after source' "$out"; }
+
+want 'json rejects non-select' 1 "$DBQ" --json local-main 'update t set x = 1' &&
+  { has 'single SELECT' "$out" && ok 'json rejects non-select' || no 'json rejects non-select' "$out"; }
+
+want 'json from stdin' 0 bash -c "echo 'select 7 as n' | '$DBQ' --json local-main" &&
+  { has '"n":7' "$out" && ok 'json from stdin' || no 'json from stdin' "$out"; }
+
+want 'json tolerates leading whitespace' 0 "$DBQ" --json local-main '   select 1 as a' &&
+  { has '"a":1' "$out" && ok 'json tolerates leading whitespace' || no 'json tolerates leading whitespace' "$out"; }
+
+want 'json tolerates a leading comment' 0 bash -c "printf -- '-- why\nselect 1 as a' | '$DBQ' --json local-main" &&
+  { has '"a":1' "$out" && ok 'json tolerates a leading comment' || no 'json tolerates a leading comment' "$out"; }
+
+want '-- ends option parsing' 0 bash -c "'$DBQ' local-main -- \$'-- why\nselect 1 as a'" &&
+  { has ' a ' "$out" && ok '-- ends option parsing' || no '-- ends option parsing' "$out"; }
+
+# ── caps and timeouts ──────────────────────────────────────────────────────
+# capped <name> <max-bytes> <sql...>  — asserts the cap holds and says so
+capped() {
+  local name="$1" max="$2"; shift 2
+  out="$("$@" 2>"$WORK/cap.err")"; local code=$? err; err="$(cat "$WORK/cap.err")"
+  if [ "$code" = 0 ] && [ "${#out}" -le "$max" ] && has 'truncated' "$err"; then
+    ok "$name"
+  else
+    no "$name" "exit $code, ${#out} bytes (max $max), stderr: $err"
+  fi
+}
+
+capped 'output capped, exit 0, notice on stderr' 400 \
+  "$DBQ" --max-bytes 400 local-main 'select generate_series(1,200000)'
+
+# A result small enough to fit the pipe buffer lets psql exit 0 before head
+# closes it, so SIGPIPE never fires — truncation must still be reported.
+capped 'small output truncation still warns' 200 \
+  "$DBQ" --max-bytes 200 local-main 'select generate_series(1,60)'
+
+out="$("$DBQ" --all local-main 'select generate_series(1,20000)' 2>&1)"; code=$?
+{ [ "$code" = 0 ] && [ "${#out}" -gt 400 ]; } &&
+  ok '--all lifts the cap' || no '--all lifts the cap' "exit $code, ${#out} bytes"
+
+want 'statement timeout fires' 1 "$DBQ" --timeout 1 local-main 'select pg_sleep(3)' &&
+  { has 'canceling statement' "$out" && ok 'statement timeout fires' || no 'statement timeout fires' "$out"; }
+
+# ── history ────────────────────────────────────────────────────────────────
+entry_ok() {
+  # entry_ok <line> <source> <exit> — all fields present with the given
+  # source and exit code.
+  python3 -c '
+import json, sys
+e = json.loads(sys.argv[1])
+ok = all(k in e for k in ("ts", "source", "sql", "rows", "duration_ms", "exit", "truncated", "wait_ms"))
+ok = ok and e.get("source") == sys.argv[2] and e.get("exit") == int(sys.argv[3])
+print("OK" if ok else "FAIL")
+' "$1" "$2" "$3" 2>/dev/null
+}
+
+"$DBQ" local-main 'select 999 as dbq_test_marker' >/dev/null 2>&1
+if [ -f "$HIST_FILE" ] && [ "$(entry_ok "$(tail -1 "$HIST_FILE")" local-main 0)" = OK ]; then
+  ok 'history records a successful local query'
+else
+  no 'history records a successful local query' "$(tail -1 "$HIST_FILE" 2>/dev/null)"
+fi
+
+"$DBQ" local-main 'select 1/0' >/dev/null 2>&1
+if [ "$(entry_ok "$(tail -1 "$HIST_FILE")" local-main 1)" = OK ]; then
+  ok 'a failing query records a non-zero exit'
+else
+  no 'a failing query records a non-zero exit' "$(tail -1 "$HIST_FILE" 2>/dev/null)"
+fi
+
+want '--history finds the marker' 0 "$DBQ" --history dbq_test_marker &&
+  { has dbq_test_marker "$out" && ok '--history finds the marker' || no '--history finds the marker' "$out"; }
+
+want '--history --source filters it out' 0 "$DBQ" --history dbq_test_marker --source prod-primary &&
+  { [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ] &&
+    ok '--history --source filters it out' || no '--history --source filters it out' "$out"; }
+
+want 'missing config errors with the file path' 1 env DBQ_CONFIG=/nonexistent/dbq/config "$DBQ" local-main 'select 1' &&
+  { has /nonexistent/dbq/config "$out" && ok 'missing config errors with the file path' ||
+    no 'missing config errors with the file path' "$out"; }
+
+want 'DBQ_CONFIG is honoured' 0 env DBQ_CONFIG="$WORK/config" "$DBQ" local-main 'select 1 as n' &&
+  { has n "$out" && ok 'DBQ_CONFIG is honoured' || no 'DBQ_CONFIG is honoured' "$out"; }
+
+# Three parallel holders of a one-slot cap: two settle in immediately, the
+# third has to wait for the first to finish — about 2s, per its pg_sleep.
+conc_conf="$WORK/conc-config"
+cat >"$conc_conf" <<EOF
+TEMPLATE="$WORK/sources.toml"
+PSQL="$(command -v psql || echo /opt/homebrew/opt/libpq/bin/psql)"
+TAILNET="example.ts.net"
+KC_SERVICE="dbq-test"
+MAX_CONCURRENT=2
+EOF
+conc_hist="$WORK/conc-state"
+for _ in 1 2 3; do
+  ( DBQ_CONFIG="$conc_conf" XDG_STATE_HOME="$conc_hist" "$DBQ" local-main 'select pg_sleep(2)' >/dev/null 2>&1 ) &
+done
+wait
+max_wait="$(python3 -c '
+import json, sys
+waits = [json.loads(l)["wait_ms"] for l in open(sys.argv[1])]
+print(max(waits))
+' "$conc_hist/dbq/history.jsonl" 2>/dev/null)"
+if [ -n "$max_wait" ] && [ "$max_wait" -ge 1500 ] && [ "$max_wait" -le 4000 ]; then
+  ok "concurrency cap: third query waited ~2s (${max_wait}ms)"
+else
+  no 'concurrency cap: third query waited ~2s' "max wait_ms=${max_wait:-none}"
+fi
+
+# ── secrets ────────────────────────────────────────────────────────────────
+"$DBQ" local-main 'select pg_sleep(3)' >/dev/null 2>&1 &
+sleep 1
+argv="$(ps -o args= -p "$(pgrep -f 'psql' | head -1)" 2>/dev/null)"
+wait
+if [ -n "$argv" ] && ! has postgrespassword "$argv"; then
+  ok 'password absent from psql argv'
+else
+  no 'password absent from psql argv' "${argv:-could not find the psql process}"
+fi
+
+printf '\n%d passed, %d failed\n\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]
