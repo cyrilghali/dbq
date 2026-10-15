@@ -16,12 +16,16 @@ DBQ="${DBQ:-$DIR/dbq}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/dbq-test.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
-# A throwaway source list: two local sources (only these are ever queried)
+# A throwaway source list: three local sources (only these are ever queried)
 # plus four unreachable placeholders, just to exercise prefix/ambiguity
 # resolution and the source listing without needing real infrastructure.
 cat >"$WORK/sources.toml" <<'EOF'
 [[sources]]
 id = "local-main"
+dsn = "postgresql://postgres:postgrespassword@localhost:5432/main"
+
+[[sources]]
+id = "local-main-write"
 dsn = "postgresql://postgres:postgrespassword@localhost:5432/main"
 
 [[sources]]
@@ -76,7 +80,7 @@ printf '\ndbq self-check (%s)\n\n' "$DBQ"
 
 # ── argument handling ──────────────────────────────────────────────────────
 want 'sources listed' 0 "$DBQ" --sources &&
-  { [ "$(printf '%s\n' "$out" | grep -c .)" = 6 ] &&
+  { [ "$(printf '%s\n' "$out" | grep -c .)" = 7 ] &&
     has prod-reports "$out" && ok 'sources listed' || no 'sources listed' "$out"; }
 
 want 'help exits 0' 0 "$DBQ" --help && ok 'help exits 0'
@@ -111,9 +115,16 @@ want 'missing flag value rejected' 1 "$DBQ" --timeout &&
 want 'source matched literally' 1 "$DBQ" local.main 'select 1' &&
   { has 'unknown source' "$out" && ok 'source matched literally' || no 'source matched literally' "$out"; }
 
+want 'write source needs its full name' 1 "$DBQ" local-main-w 'select 1' &&
+  { has "unknown source 'local-main-w'" "$out" && ok 'write source needs its full name' ||
+    no 'write source needs its full name' "$out"; }
+
 # ── local queries ──────────────────────────────────────────────────────────
 want 'unique prefix resolves' 0 "$DBQ" local-m 'select 1 as n' &&
   { has 'n' "$out" && ok 'unique prefix resolves' || no 'unique prefix resolves' "$out"; }
+
+want 'write source resolves by full name' 0 "$DBQ" local-main-write 'select 1 as n' &&
+  { has 'n' "$out" && ok 'write source resolves by full name' || no 'write source resolves by full name' "$out"; }
 
 want 'sql from stdin' 0 bash -c "echo 'select 42 as answer' | '$DBQ' local-main" &&
   { has 42 "$out" && ok 'sql from stdin' || no 'sql from stdin' "$out"; }
