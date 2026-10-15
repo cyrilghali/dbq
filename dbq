@@ -178,6 +178,8 @@ dbq --history [pattern]
 
 Any source not named local-* runs read-only with a statement timeout and a
 cap on concurrent connections (MAX_CONCURRENT in the config); local does not.
+A source named *-write keeps the timeout and the cap but can write, and is
+selected only by its full name, never by a prefix.
 Output is capped only when stdout is not a terminal, so interactive paging is
 unaffected — a truncated run says so on stderr and still exits 0.
 Exit codes are psql's: 0 ok, 1 SQL error, 2 connection failure.
@@ -220,12 +222,14 @@ done
 
 # Resolve the source by exact name, else by unique prefix. Matched literally:
 # through grep, a typo like `local.main` would quietly resolve to local-main.
+# A *-write source answers only to its full name, so no shorthand (and no
+# approval rule matching on that name) can miss a writable connection.
 WANT="$1"; shift
 SOURCE=""
 matches=()
 while IFS= read -r s; do
   [ "$s" = "$WANT" ] && SOURCE="$s"
-  case "$s" in "$WANT"*) matches+=("$s") ;; esac
+  case "$s" in *-write) ;; "$WANT"*) matches+=("$s") ;; esac
 done < <(sources)
 if [ -z "$SOURCE" ]; then
   case ${#matches[@]} in
@@ -348,7 +352,7 @@ opts=("-c" "application_name=dbq")
 [ "$TIMEOUT" -gt 0 ] && opts+=("-c" "statement_timeout=$((TIMEOUT * 1000))")
 if [[ "$SOURCE" != local-* ]]; then
   export PGCONNECT_TIMEOUT=10
-  opts+=("-c" "default_transaction_read_only=on")
+  [[ "$SOURCE" == *-write ]] || opts+=("-c" "default_transaction_read_only=on")
 else
   export PGCONNECT_TIMEOUT=5
 fi

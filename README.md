@@ -18,8 +18,8 @@ dbq --history "users"          # search past queries
 - **Credentials never touch argv.** Passwords come from the macOS keychain
   and are exported as `PG*` environment variables, never passed as CLI
   arguments.
-- **Read-only by convention.** Any source not named `local-*` runs with
-  `default_transaction_read_only=on` and a statement timeout.
+- **Read-only by convention.** Any source not named `local-*` or `*-write`
+  runs with `default_transaction_read_only=on` and a statement timeout.
 - **A local audit trail.** Every query, successful or not, is appended as
   one JSON line to a local history file, searchable with `dbq --history`.
 - **A concurrency cap.** Non-local sources are capped at a small number of
@@ -89,6 +89,11 @@ security add-generic-password -s dbq -a password -w '<the password>'
 A source named `local-*` skips the tailnet check, the read-only transaction,
 the statement timeout and the concurrency cap: it's meant for a database on
 your own machine.
+
+A source named `*-write` is a remote database you mean to write to. It keeps
+the tailnet check, the statement timeout and the concurrency cap, but skips
+the read-only transaction. It answers only to its full name: `dbq staging-w`
+never reaches `staging-write`, so a typo can't open a writable connection.
 
 ## Use
 
