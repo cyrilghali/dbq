@@ -180,6 +180,9 @@ Any source not named local-* runs read-only with a statement timeout and a
 cap on concurrent connections (MAX_CONCURRENT in the config); local does not.
 A source named *-write keeps the timeout and the cap but can write, and is
 selected only by its full name, never by a prefix.
+With GUARDED_TABLES set in the config, a read-only source plans each statement
+that names one of those tables first, and refuses it before it runs when the
+plan reads the table in parallel or reads more of it than GUARD_MAX_COST.
 Output is capped only when stdout is not a terminal, so interactive paging is
 unaffected — a truncated run says so on stderr and still exits 0.
 Exit codes are psql's: 0 ok, 1 SQL error, 2 connection failure.
@@ -420,6 +423,214 @@ if [ -z "$HIST_SQL" ]; then
   done
 fi
 START_MS="$(now_ms)"
+
+# ── scan guard ─────────────────────────────────────────────────────────────
+# A table in GUARDED_TABLES is too big to scan on a shared read source: every
+# statement that names one is planned first (EXPLAIN, which reads no rows),
+# and refused before it runs if the plan reads the table in parallel, or if
+# the plan or any scan of the table in it costs more than GUARD_MAX_COST (a
+# LIMIT discounts the plan's cost as if matches came early, but its scan may
+# read the whole table to find them). The plan is checked rather than the SQL
+# text, so aliases, CTEs and subqueries are judged by what they read. The SQL
+# comes from every way psql takes it — the bare/stdin SQL, -c values and -f
+# files, in the order psql runs them — and an interactive session, which
+# offers no SQL to check, is off. This stops a careless query, not a caller
+# set on getting past it: that caller holds the password and can run psql.
+: "${GUARD_MAX_COST:=500000}"
+if [ -n "${GUARDED_TABLES:-}" ] && [[ "$SOURCE" != local-* && "$SOURCE" != *-write ]]; then
+  tty=0; [ -t 0 ] && tty=1
+  set +e
+  python3 - "$PSQL" "$GUARDED_TABLES" "$GUARD_MAX_COST" "$SOURCE" "$tty" "$SQL" ${PSQL_ARGS+"${PSQL_ARGS[@]}"} <<'PY'
+import json, os, re, subprocess, sys
+
+psql, tables, max_cost, source = sys.argv[1], sys.argv[2].lower().split(), float(sys.argv[3]), sys.argv[4]
+tty, sql, args = sys.argv[5] == "1", sys.argv[6], sys.argv[7:]
+names = re.compile(r"\b(%s)\b" % "|".join(map(re.escape, tables)), re.I)
+# The check's own connection gets a short timeout, set after any replayed
+# SET: if a statement were ever split wrongly, a real query riding along in
+# the EXPLAIN dies in seconds.
+env = dict(os.environ, PGOPTIONS=os.environ.get("PGOPTIONS", "") + " -c statement_timeout=5000")
+
+def refuse(msg, code=1):
+    sys.stderr.write("dbq: refused, nothing ran: %s\n" % msg)
+    sys.exit(code)
+
+def inputs(sql, args):
+    # psql's own option grammar: a short-option cluster ends at the first
+    # letter that takes a value, which is the rest of the cluster or the next
+    # argument; a long option takes its value after = or as the next argument.
+    out = [("c", sql)] if sql else []
+    takes = "cdfhpUvFRPoLT"
+    long_takes = {"command", "file", "dbname", "host", "port", "username", "set", "variable",
+                  "field-separator", "record-separator", "pset", "output", "log-file", "table-attr"}
+    long_flags = {"echo-all", "no-align", "echo-queries", "echo-errors", "echo-hidden", "field-separator-zero",
+                  "html", "list", "no-readline", "single-transaction", "quiet", "record-separator-zero",
+                  "single-step", "single-line", "tuples-only", "version", "no-password", "password",
+                  "expanded", "no-psqlrc", "help", "csv"}
+    i = 0
+    while i < len(args):
+        a = args[i]; i += 1
+        if a.startswith("--"):
+            name, eq, val = a[2:].partition("=")
+            # getopt_long takes any unique prefix: --comm is --command.
+            known = [o for o in long_takes | long_flags if o.startswith(name)]
+            name = name if name in known else known[0] if len(known) == 1 else name
+            if name in long_takes:
+                if not eq:
+                    val = args[i] if i < len(args) else ""; i += 1
+                if name in ("command", "file", "dbname", "set", "variable"):
+                    out.append(("v" if name in ("set", "variable") else name[0], val))
+        elif a.startswith("-") and len(a) > 1:
+            for k, ch in enumerate(a[1:]):
+                if ch in takes:
+                    val = a[k + 2:]
+                    if not val:
+                        val = args[i] if i < len(args) else ""; i += 1
+                    if ch in "cdfv":
+                        out.append((ch, val))
+                    break
+        else:
+            out.append(("d", a))  # psql reads a bare argument as a database name
+    return out
+
+def statements(sql):
+    # Split where the server would: on ; outside strings, quoted names,
+    # comments and dollar quotes, with the server's rules for E'' escapes,
+    # nested /* */ comments and $ inside a name. A psql backslash command is
+    # returned on its own as "\..." up to the end of its line.
+    out, start, i, n = [], 0, 0, len(sql)
+    ident = lambda k: k >= 0 and (sql[k].isalnum() or sql[k] in "_$")
+    while i < n:
+        c = sql[i]
+        if c == "\\":
+            if sql[start:i].strip():
+                refuse("a psql backslash command inside a statement is not checked: %.60s" % sql[start:i + 10])
+            j = sql.find("\n", i); j = n if j < 0 else j
+            out.append(sql[i:j]); start = i = j
+        elif c == "'" and i > 0 and sql[i - 1] in "eE" and not ident(i - 2):
+            i += 1
+            while i < n and sql[i] != "'":
+                i += 2 if sql[i] == "\\" else 1
+            i += 1
+        elif c in "'\"":
+            j = sql.find(c, i + 1); i = n if j < 0 else j + 1
+        elif sql.startswith("--", i):
+            j = sql.find("\n", i); i = n if j < 0 else j
+        elif sql.startswith("/*", i):
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if sql.startswith("/*", i): depth, i = depth + 1, i + 2
+                elif sql.startswith("*/", i): depth, i = depth - 1, i + 2
+                else: i += 1
+        elif c == "$" and not ident(i - 1) and re.match(r"\$(?:[^\W\d]\w*)?\$", sql[i:]):
+            tag = re.match(r"\$(?:[^\W\d]\w*)?\$", sql[i:]).group(0)
+            j = sql.find(tag, i + len(tag)); i = n if j < 0 else j + len(tag)
+        elif c == ";":
+            out.append(sql[start:i]); start = i = i + 1
+        else:
+            i += 1
+    out.append(sql[start:])
+    return [s.strip() for s in out if s.strip()]
+
+def nodes(plan):
+    yield plan
+    for p in plan.get("Plans", []):
+        yield from nodes(p)
+
+def indexed_filters(table):
+    r = subprocess.run([psql, "-X", "-q", "-t", "-A", "-c",
+                        "select indexdef from pg_indexes where tablename = '%s'" % table],
+                       capture_output=True, text=True, env=env)
+    cols = [m.group(1) for d in r.stdout.splitlines()
+            for m in [re.search(r"USING btree \(([^()]*)\)$", d)] if m]
+    return " or ".join("(%s)" % c for c in cols) or "none found"
+
+def check(stmt, replay):
+    cmd = [psql, "-X", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1"]
+    for s in replay:
+        cmd += ["-c", s]
+    cmd += ["-c", "set statement_timeout = 5000", "-c", "explain (format json) " + stmt]
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    try:
+        plan = json.loads(r.stdout)[0]["Plan"] if r.returncode == 0 else None
+    except ValueError:
+        plan = None
+    if plan is None:
+        sys.stderr.write(r.stderr)
+        refuse("dbq could not plan this statement, so it could not check it", 2 if r.returncode == 2 else 1)
+    hit = [p for p in nodes(plan) if p.get("Relation Name", "").lower() in tables]
+    if not hit:
+        return
+    table = hit[0]["Relation Name"]
+    scan = max(p["Total Cost"] for p in hit)
+    if any(p.get("Parallel Aware") for p in hit):
+        why = "the plan scans %s in parallel" % table
+    elif plan["Total Cost"] > max_cost:
+        why = "the plan reads too much of %s (cost %d, limit %d)" % (table, plan["Total Cost"], max_cost)
+    elif scan > max_cost:
+        why = "the plan has a scan of %s that may read all of it (cost %d, limit %d)" % (table, scan, max_cost)
+    else:
+        return
+    refuse("%s\ndbq: filter on the leading columns of an index: %s\ndbq: see the plan with: dbq %s \"explain <your query>\""
+           % (why, indexed_filters(table), source))
+
+items = inputs(sql, args)
+if tty and not any(kind in "cf" for kind, _ in items):
+    refuse("interactive psql is off on %s, because queries on %s are checked before they run — pass the SQL as an argument"
+           % (source, " ".join(tables)))
+texts = []
+for kind, val in items:
+    if kind == "d":
+        refuse("-d is not allowed on %s: dbq connects to the source's own database" % source)
+    if kind == "v":
+        refuse("psql variables are not allowed on %s: dbq checks the SQL before psql fills them in" % source)
+    if kind == "f":
+        # /dev/stdin here would be this script's own heredoc, not the caller's pipe.
+        if val == "-" or val.startswith("/dev/") or os.path.exists(val) and not os.path.isfile(val):
+            refuse("-f %s is not a plain file, so dbq cannot read it first — pass the SQL as an argument" % val)
+        try:
+            val = open(val, errors="replace").read()
+        except OSError:
+            continue  # psql reports the missing file itself
+    texts.append(val)
+if any(names.search(t) for t in texts) and any(re.search(r"set_config", t, re.I) for t in texts):
+    refuse("set_config() would change the plan after dbq checks it — use SET")
+if any(re.search(r"U&['\"]|standard_conforming_strings|_to_xml\w*\s*\(", t, re.I) for t in texts):
+    refuse("dbq cannot check U& escapes, standard_conforming_strings or the *_to_xml functions on %s" % source)
+
+replay = []  # psql runs every -c and -f in one session, so a SET carries on
+for text in texts:
+    for stmt in statements(text):
+        head = re.sub(r"^(\s+|--[^\n]*|/\*.*?\*/)*", "", stmt, flags=re.S)
+        if head.startswith("\\"):
+            if not re.match(r"\\d[^\s\\`]*(\s+[^\s\\`]+)*\s*$", head):
+                refuse("dbq checks only \\d backslash commands on %s: %.60s" % (source, head))
+            continue
+        if not names.search(stmt):
+            if re.match(r"(set|reset|begin|start\s+transaction|commit|rollback|end|abort)\b", head, re.I):
+                replay.append(stmt)
+            continue
+        # EXPLAIN alone only plans; EXPLAIN ANALYZE runs the statement after it.
+        # Any "analy" in the text counts as ANALYZE, so a comment or an escape
+        # in the options can't hide it; the statement checked is the text from
+        # the first SELECT-like word on, which fails to plan if that guess is
+        # wrong.
+        if re.match(r"explain\b", head, re.I):
+            if not re.search(r"analy", stmt, re.I):
+                continue
+            m = re.search(r"\b(select|with|table|values)\b", head[7:], re.I)
+            head = head[7 + m.start():] if m else head[7:]
+        if not re.match(r"[(\s]*(select|with|table|values)\b", head, re.I):
+            refuse("dbq checks only SELECT statements on %s, and this one is not: %.60s" % (" ".join(tables), head))
+        check(head, replay)
+PY
+  guard=$?
+  set -e
+  if [ "$guard" -ne 0 ]; then
+    record_history "$guard" "" false 0
+    exit "$guard"
+  fi
+fi
 
 # A slot always frees within its holder's statement timeout, so the wait for
 # one follows it; --timeout 0 (no timeout) falls back to a flat 10 minutes
