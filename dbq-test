@@ -267,6 +267,131 @@ else
   no 'concurrency cap: third query waited ~2s' "max wait_ms=${max_wait:-none}"
 fi
 
+# ── scan guard ─────────────────────────────────────────────────────────────
+# The guard skips local-*, so "remote-main" points at the local database under
+# a non-local name. A stub tailscale reports this test's tailnet as connected,
+# so dbq never switches the real one; any other tailscale call fails loudly.
+mkdir -p "$WORK/bin"
+cat >"$WORK/bin/tailscale" <<'EOF'
+#!/bin/bash
+[ "$*" = "status --json" ] || exit 1
+echo '{"BackendState":"Running","CurrentTailnet":{"Name":"example.ts.net"}}'
+EOF
+chmod +x "$WORK/bin/tailscale"
+cat >"$WORK/guard-sources.toml" <<'EOF'
+[[sources]]
+id = "local-main"
+dsn = "postgresql://postgres:postgrespassword@localhost:5432/main"
+
+[[sources]]
+id = "remote-main"
+dsn = "postgresql://postgres:postgrespassword@localhost:5432/main"
+EOF
+cat >"$WORK/guard-config" <<EOF
+TEMPLATE="$WORK/guard-sources.toml"
+PSQL="$(command -v psql || echo /opt/homebrew/opt/libpq/bin/psql)"
+TAILNET="example.ts.net"
+KC_SERVICE="dbq-test"
+GUARDED_TABLES="dbq_guard_jobs"
+EOF
+gdbq() { env PATH="$WORK/bin:$PATH" DBQ_CONFIG="$WORK/guard-config" GUARD_MAX_COST="${COST:-50}" "$DBQ" "$@"; }
+gdbq local-main 'drop table if exists dbq_guard_jobs, dbq_guard_other;
+  create table dbq_guard_jobs (id bigint primary key, worker text);
+  insert into dbq_guard_jobs select g, $$w$$ || (g % 50) from generate_series(1, 20000) g;
+  create table dbq_guard_other as table dbq_guard_jobs;
+  analyze dbq_guard_jobs, dbq_guard_other' >/dev/null 2>&1
+trap 'gdbq local-main "drop table if exists dbq_guard_jobs, dbq_guard_other" >/dev/null 2>&1; rm -rf "$WORK"' EXIT
+
+# refused <name> <cmd...> — refused, and the table's scan counter (which
+# EXPLAIN never moves) shows no statement reached it.
+scans() { gdbq local-main -t -A 'select seq_scan + coalesce(idx_scan, 0) from pg_stat_user_tables where relname = $$dbq_guard_jobs$$' 2>/dev/null; }
+refused() {
+  local name="$1" before; shift
+  before="$(scans)"
+  out="$("$@" 2>&1 </dev/null)"; local got=$?
+  if [ "$got" != 0 ] && has 'refused' "$out" && [ -n "$before" ] && [ "$(scans)" = "$before" ]; then
+    ok "$name"
+  else
+    no "$name" "exit $got, scans $before -> $(scans): $out"
+  fi
+}
+refused 'guard refuses a scan before it runs' gdbq remote-main 'select pg_sleep(1), count(*) from dbq_guard_jobs'
+has '(id)' "$out" && ok 'guard refusal names the indexed columns' || no 'guard refusal names the indexed columns' "$out"
+
+want 'guard allows an indexed lookup' 0 gdbq remote-main 'select worker from dbq_guard_jobs where id = 7' &&
+  { has w7 "$out" && ok 'guard allows an indexed lookup' || no 'guard allows an indexed lookup' "$out"; }
+
+want 'guard leaves other tables alone' 0 gdbq remote-main 'select count(*) from dbq_guard_other' &&
+  { has 20000 "$out" && ok 'guard leaves other tables alone' || no 'guard leaves other tables alone' "$out"; }
+
+want 'guard leaves local sources alone' 0 gdbq local-main 'select count(*) from dbq_guard_jobs' &&
+  ok 'guard leaves local sources alone'
+
+want 'guard sees through an alias in a CTE' 1 gdbq remote-main 'with j as (select * from DBQ_GUARD_JOBS x) select count(*) from j' &&
+  { has 'refused' "$out" && ok 'guard sees through an alias in a CTE' || no 'guard sees through an alias in a CTE' "$out"; }
+
+want 'guard checks every statement' 1 gdbq remote-main 'select 1 as a; select count(*) from dbq_guard_jobs' &&
+  { has 'refused' "$out" && ! has ' a ' "$out" && ok 'guard checks every statement' || no 'guard checks every statement' "$out"; }
+
+printf 'select count(*) from dbq_guard_jobs;\n' >"$WORK/guard.sql"
+want 'guard checks -f files' 1 gdbq remote-main -f "$WORK/guard.sql" &&
+  { has 'refused' "$out" && ok 'guard checks -f files' || no 'guard checks -f files' "$out"; }
+
+want 'plain explain passes the guard' 0 gdbq remote-main 'explain select count(*) from dbq_guard_jobs' &&
+  { has 'Seq Scan' "$out" && ok 'plain explain passes the guard' || no 'plain explain passes the guard' "$out"; }
+
+want 'explain analyze is checked' 1 gdbq remote-main 'explain (analyze, buffers) select count(*) from dbq_guard_jobs' &&
+  { has 'refused' "$out" && ok 'explain analyze is checked' || no 'explain analyze is checked' "$out"; }
+
+want '\d passes the guard' 0 gdbq remote-main '\d dbq_guard_jobs' &&
+  { has 'worker' "$out" && ok '\d passes the guard' || no '\d passes the guard' "$out"; }
+
+want 'non-select on a guarded table refused' 1 gdbq remote-main 'copy (select * from dbq_guard_jobs) to stdout' &&
+  { has 'only SELECT' "$out" && ok 'non-select on a guarded table refused' || no 'non-select on a guarded table refused' "$out"; }
+
+want 'a statement that fails to plan is refused' 1 gdbq remote-main 'select nope from dbq_guard_jobs' &&
+  { has 'could not plan' "$out" && has 'nope' "$out" && ok 'a statement that fails to plan is refused' ||
+    no 'a statement that fails to plan is refused' "$out"; }
+
+# Under a cost limit no plan here reaches, only the parallel rule can refuse,
+# and only once the replayed SETs make the planner go parallel.
+parallel='set parallel_setup_cost = 0; set parallel_tuple_cost = 0; set min_parallel_table_scan_size = 0; set max_parallel_workers_per_gather = 2'
+gdbq_uncapped() { COST=1000000000 gdbq "$@"; }
+want 'serial plan under the cost limit passes' 0 gdbq_uncapped remote-main 'select count(*) from dbq_guard_jobs' &&
+  ok 'serial plan under the cost limit passes'
+want 'replayed SETs make a parallel scan, refused' 1 gdbq_uncapped remote-main "$parallel; select count(*) from dbq_guard_jobs" &&
+  { has 'in parallel' "$out" && ok 'replayed SETs make a parallel scan, refused' || no 'replayed SETs make a parallel scan, refused' "$out"; }
+
+printf '%s\n' '\d dbq_guard_jobs \\ select count(*) from dbq_guard_jobs' >"$WORK/guard-meta.sql"
+refused 'guard: a LIMIT over a filtered scan' gdbq remote-main 'select id from dbq_guard_jobs where worker = $$w7$$ limit 1'
+refused 'guard: --command=' gdbq remote-main '--command=select count(*) from dbq_guard_jobs'
+refused 'guard: -c inside a flag cluster' gdbq remote-main '-qcselect count(*) from dbq_guard_jobs'
+refused 'guard: \i of a file' gdbq remote-main "\\i $WORK/guard.sql"
+refused 'guard: SQL after \\ on a \d line' gdbq remote-main -f "$WORK/guard-meta.sql"
+refused "guard: E'' escape in the lexer" gdbq remote-main "select E'\\''; select count(*) from dbq_guard_jobs; select 'z'"
+refused 'guard: $ inside a name in the lexer' gdbq remote-main 'select 1 as a$b$; select count(*) from dbq_guard_jobs; select 1 as c$b$'
+refused 'guard: a comment between EXPLAIN and ANALYZE' gdbq remote-main 'explain /* c */ analyze select count(*) from dbq_guard_jobs'
+refused 'guard: a SET in an earlier -c' gdbq_uncapped remote-main -c "$parallel" -c 'select count(*) from dbq_guard_jobs'
+refused 'guard: set_config()' gdbq remote-main 'select set_config($$enable_indexscan$$, $$off$$, false); select worker from dbq_guard_jobs where id = 7'
+refused 'guard: -d' gdbq remote-main -d 'dbname=main' 'select worker from dbq_guard_jobs where id = 7'
+printf '%s\n' '\d\\select count(*) from dbq_guard_jobs;' >"$WORK/guard-chain.sql"
+refused 'guard: a LIMIT over a filter above the scan' gdbq remote-main 'select * from (select * from dbq_guard_jobs offset 0) s where worker = $$w7$$ limit 1'
+refused 'guard: an abbreviated --comm=' gdbq remote-main '--comm=select count(*) from dbq_guard_jobs'
+refused 'guard: -f /dev/stdin' bash -c "echo 'select count(*) from dbq_guard_jobs' | DBQ='$DBQ' WORK='$WORK' COST=50 PATH='$WORK/bin:$PATH' DBQ_CONFIG='$WORK/guard-config' GUARD_MAX_COST=50 '$DBQ' remote-main -f /dev/stdin"
+refused 'guard: a command chained after \d' gdbq remote-main -f "$WORK/guard-chain.sql"
+refused 'guard: a comment that hides ANALYZE' gdbq remote-main '/* /* */ explain */ explain analyze select count(*) from dbq_guard_jobs'
+refused 'guard: a U& escaped name' gdbq remote-main 'select count(*) from U&"dbq!005fguard!005fjobs" uescape $$!$$'
+refused 'guard: psql variables' gdbq remote-main -v t=dbq_guard_jobs 'select 1'
+out="$(script -q /dev/null env PATH="$WORK/bin:$PATH" DBQ_CONFIG="$WORK/guard-config" "$DBQ" remote-main </dev/null 2>&1)"
+has 'interactive psql is off' "$out" && ok 'guard: interactive psql is off' || no 'guard: interactive psql is off' "$out"
+
+gdbq remote-main 'select count(*) from dbq_guard_jobs' >/dev/null 2>&1
+if [ "$(entry_ok "$(tail -1 "$HIST_FILE")" remote-main 1)" = OK ]; then
+  ok 'a refused query is recorded with exit 1'
+else
+  no 'a refused query is recorded with exit 1' "$(tail -1 "$HIST_FILE" 2>/dev/null)"
+fi
+
 # ── secrets ────────────────────────────────────────────────────────────────
 "$DBQ" local-main 'select pg_sleep(3)' >/dev/null 2>&1 &
 sleep 1

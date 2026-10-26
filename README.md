@@ -61,6 +61,34 @@ KC_SERVICE="dbq"
 | `KC_SERVICE` | The macOS keychain service name holding your passwords. Also used as the prefix for the DSN placeholders below. |
 | `MAX_CONCURRENT` | Concurrent-connection cap per non-local source (default 2; local sources are unlimited unless you set this). |
 | `QUEUE_WAIT_FACTOR` | A query waiting for a free slot gives up after `QUEUE_WAIT_FACTOR × --timeout` seconds (600s if `--timeout 0`). |
+| `GUARDED_TABLES` | Space-separated tables too big to scan on a shared read source (empty by default). See [Scan guard](#scan-guard). |
+| `GUARD_MAX_COST` | Planner cost above which a query on a guarded table is refused (default 500000, about 4 GB of page reads). |
+
+### Scan guard
+
+On a read-only source (not `local-*`, not `*-write`), each statement that
+names a table in `GUARDED_TABLES` is run through `EXPLAIN` first, which plans
+it without reading rows. `dbq` refuses the statement before it runs when the
+plan reads that table in parallel, or when the plan or any scan of that table
+in it costs more than `GUARD_MAX_COST` (a `LIMIT` lowers the plan's cost as
+if matches came early, but its scan may read the whole table to find them).
+The refusal lists the table's btree indexes, so the caller can add a filter
+one of them serves.
+
+The guard stops a careless query, not a caller set on getting past it: that
+caller holds the password and can run `psql` directly.
+
+The check reads the plan, not the SQL text, so an alias, a CTE or a
+subquery is judged by what it actually reads. It reads the SQL from every
+place psql takes it: the argument, stdin, each `-c` and each `-f` file.
+Earlier `SET` statements in the same call are replayed before the `EXPLAIN`,
+so they shape the plan the same way. A plain `EXPLAIN` and `\d` pass;
+`EXPLAIN ANALYZE` is checked like the statement it runs. On these sources
+`dbq` refuses what it can't check: a statement on a guarded table that is not
+a `SELECT` or fails to plan, any backslash command other than a plain `\d`,
+`-d`, psql variables, an `-f` that isn't a plain file, `set_config()` next to
+a guarded table, `U&` escapes, `standard_conforming_strings`, the `*_to_xml`
+functions, and an interactive session.
 
 ### Source template
 
